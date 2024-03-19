@@ -2,9 +2,15 @@
 
 Shimmer3 integration directly in Unity.
 
-> Tested with shimmer3 device on unity 2021.3.X (Use a different version with caution)
+## Disclaimer :warning:
 
-## Usage
+If you would like to use this package in your projects or research please acknowledge the original authors by citing this repository.
+
+> github.com/jemmec/shimmering-unity
+
+## Usage :question:
+
+> Note: This was tested with a shimmer3 device on unity 2021.3.X (please use a different version with caution).
 
 1. Download the latest [unity package](https://github.com/jemmec/shimmering-unity/releases/latest) from releases and import it into your unity project.
 
@@ -15,7 +21,7 @@ Shimmer3 integration directly in Unity.
 
 5. Run your project and test the connection with the [Connect] and [StartStreaming] buttons in the inspector.
 
-## Examples
+## Examples :heavy_check_mark:
 
 ### Shimmer data logger
 The `ShimmerDataLogger` script is an example way to log specific data from the shimmer device easily.
