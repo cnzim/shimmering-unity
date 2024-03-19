@@ -11,8 +11,9 @@ Shimmer3 integration directly in Unity.
 2. Add the `ShimmerDevice` component to a GameObject in your scene (alternatively, open the `ExampleScene` scene).
 
 3. Setup configuration through the `ShimmerDevice` inspector, setting the COM port and Sampling rate to match your connected shimmer device.
+     > don't forget to enable the sensors you would like to use here as well, otherwise they won't show up!
 
-4. Run your project and test the connection with the [Connect] and [StartStreaming] buttons.
+5. Run your project and test the connection with the [Connect] and [StartStreaming] buttons in the inspector.
 
 ## Examples
 
