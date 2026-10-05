@@ -1,4 +1,4 @@
-# Shimmer sensor 3 via Unity
+# Shimmer sensor 3 and Shimmer sensor 3R support via Unity
 
 Shimmer3 integration directly in Unity.
 
