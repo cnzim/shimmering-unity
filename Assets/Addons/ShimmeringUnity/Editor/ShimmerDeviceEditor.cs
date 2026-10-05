@@ -21,6 +21,15 @@ namespace ShimmeringUnity
             else
                 GUILayout.Label($"<size=24><color=#ff0000>App not running.</color></size>", style);
 
+            if (Application.isPlaying)
+            {
+                EditorGUILayout.LabelField("Hardware", shimmerDevice.HardwareVersion < 0 ? "Not detected" : ((ShimmerAPI.ShimmerBluetooth.ShimmerVersion)shimmerDevice.HardwareVersion).ToString());
+                EditorGUILayout.LabelField("Firmware", shimmerDevice.FirmwareVersion);
+                EditorGUILayout.LabelField("Actual sample rate", $"{shimmerDevice.ActualSamplingRate:F2} Hz");
+                EditorGUILayout.LabelField("Packets received / pending / dropped", $"{shimmerDevice.ReceivedPackets} / {shimmerDevice.PendingPackets} / {shimmerDevice.DroppedPackets}");
+                if (!string.IsNullOrEmpty(shimmerDevice.LastError)) EditorGUILayout.HelpBox(shimmerDevice.LastError, MessageType.Warning);
+            }
+
             if (Application.isPlaying && GUILayout.Button("Connect"))
             {
                 shimmerDevice.Connect();
@@ -37,7 +46,7 @@ namespace ShimmeringUnity
             {
                 shimmerDevice.StopStreaming();
             }
-            if (Application.isPlaying && GUILayout.Button("Force Abort Thread"))
+            if (Application.isPlaying && GUILayout.Button("Cancel Connection / Close Port"))
             {
                 shimmerDevice.ForceAbortThread();
             }

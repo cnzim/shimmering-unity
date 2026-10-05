@@ -10,7 +10,7 @@ namespace ShimmeringUnity
 {
 
     /// <summary>
-    /// Handles inital connection and streaming of data from a Shimmer3 device
+    /// Handles connection and streaming from Shimmer3 and Shimmer3R devices
     /// </summary>
     public class ShimmerDevice : MonoBehaviour
     {
@@ -180,205 +180,286 @@ namespace ShimmeringUnity
 
         public StateChangeEvent OnStateChanged => onStateChanged;
 
-        //Private members
-        private Queue<ObjectCluster> shimmerDataQueue = new Queue<ObjectCluster>();
-        private Queue<State> shimmerStateQueue = new Queue<State>();
-        private Thread shimmerThread = null;
-        private ShimmerBluetooth shimmer;
-        private int connectionCount;
-        //The connect blocker prevents multiple threads from spawning
-        private bool connectBlocker = false;
-        private int waitBufferMilliseconds = 250;
+        [SerializeField, Tooltip("Apply the Inspector settings after hardware detection. Disable to read the device's existing configuration.")]
+        private bool applyConfigurationOnConnect = true;
+        public bool ApplyConfigurationOnConnect { get => applyConfigurationOnConnect; set => applyConfigurationOnConnect = value; }
+
+        public int HardwareVersion { get; private set; } = -1;
+        public bool IsShimmer3R => HardwareVersion == (int)ShimmerBluetooth.ShimmerVersion.SHIMMER3R;
+        public string FirmwareVersion { get; private set; } = "";
+        public double ActualSamplingRate { get; private set; }
+        public long ActualEnabledSensors { get; private set; }
+        public string LastError { get; private set; } = "";
+        public string LastNotification { get; private set; } = "";
+        public long ReceivedPackets { get; private set; }
+        public long DroppedPackets => session == null ? 0 : Interlocked.Read(ref session.DroppedPackets);
+        public int PendingPackets => session == null ? 0 : session.Data.Count;
+
+        // Each connection owns its queues and API instance. Old callbacks cannot affect a new connection.
+        private sealed class Session
+        {
+            public UnityShimmerSerialPort Device;
+            public Thread Worker;
+            public EventHandler Callback;
+            public readonly ManualResetEventSlim ConnectionReady = new ManualResetEventSlim(false);
+            public readonly System.Collections.Concurrent.BlockingCollection<Action> Commands =
+                new System.Collections.Concurrent.BlockingCollection<Action>();
+            public readonly System.Collections.Concurrent.ConcurrentQueue<State> States =
+                new System.Collections.Concurrent.ConcurrentQueue<State>();
+            public readonly System.Collections.Concurrent.ConcurrentQueue<string> Messages =
+                new System.Collections.Concurrent.ConcurrentQueue<string>();
+            public readonly System.Collections.Concurrent.ConcurrentQueue<string> Notifications =
+                new System.Collections.Concurrent.ConcurrentQueue<string>();
+            public readonly System.Collections.Concurrent.ConcurrentQueue<ObjectCluster> Data =
+                new System.Collections.Concurrent.ConcurrentQueue<ObjectCluster>();
+            public volatile bool Stopping;
+            public volatile bool Configured;
+            public long DroppedPackets;
+        }
+
+        private Session session;
 
         private void Update()
         {
-            //Dequeue loop
-            if (shimmerDataQueue.Count > 0)
+            var current = session;
+            if (current == null) return;
+            while (current.Notifications.TryDequeue(out string notification))
             {
-                ObjectCluster objectCluster = shimmerDataQueue.Dequeue();
-                OnDataRecieved.Invoke(this, objectCluster);
+                LastNotification = notification;
+                Debug.Log($"Shimmer {devName}: {notification}", this);
+            }
+            while (current.Messages.TryDequeue(out string message))
+            {
+                LastError = message;
+                Debug.LogWarning($"Shimmer {devName} ({comPort}): {message}", this);
+            }
+            while (current.States.TryDequeue(out State state))
+            {
+                if (state == State.Connected)
+                {
+                    HardwareVersion = current.Device.GetShimmerVersion();
+                    FirmwareVersion = current.Device.GetFirmwareVersionFullName();
+                    ActualSamplingRate = current.Device.GetSamplingRate();
+                    ActualEnabledSensors = current.Device.GetEnabledSensors();
+                    Debug.Log($"Shimmer {devName}: {(ShimmerBluetooth.ShimmerVersion)HardwareVersion}, {FirmwareVersion}, {ActualSamplingRate:F2} Hz, sensors 0x{ActualEnabledSensors:X6}", this);
+                }
+                SetState(state);
+            }
+            // Drain more than one sample per frame; the bound also keeps high-rate streams responsive.
+            for (int i = 0; i < 512 && current.Data.TryDequeue(out ObjectCluster data); i++)
+            {
+                if (CurrentState != State.Streaming) continue;
+                ReceivedPackets++;
+                OnDataRecieved.Invoke(this, data);
             }
         }
 
-        private void OnApplicationQuit()
+        private void SetState(State state)
         {
-            Disconnect();
+            if (CurrentState == state) return;
+            CurrentState = state;
+            OnStateChanged.Invoke(this, state);
         }
 
-        /// <summary>
-        /// Trys to connect to a Shimmer3 bluetooth device given the configuration
-        /// </summary>
+        private void OnDisable() => Shutdown();
+        private void OnDestroy() => Shutdown();
+        private void OnApplicationQuit() => Shutdown();
+
+        /// <summary>Connect through Bluetooth Classic's COM port, detect hardware, then configure it.</summary>
         public void Connect()
         {
-            //Prevent from connecting again
-            if (connectBlocker) return;
-            if ((CurrentState == State.None ||
-                CurrentState == State.Disconnected))
+            if (!isActiveAndEnabled || (session != null && session.Worker.IsAlive)) return;
+            if (string.IsNullOrWhiteSpace(comPort) || samplingRate <= 0 || float.IsNaN(samplingRate) || float.IsInfinity(samplingRate))
             {
-                shimmerThread = new Thread(ConnectionThread);
-                shimmerThread.Start();
+                LastError = "Enter a COM port and a positive, finite sampling rate.";
+                Debug.LogWarning(LastError, this);
+                return;
             }
-        }
 
-        /// <summary>
-        /// Trys to disconnected from the currently connected device
-        /// </summary>
-        public void Disconnect()
-        {
-            if (CurrentState == State.Connected ||
-            CurrentState == State.Connecting ||
-            CurrentState == State.Streaming)
+            // Snapshot Unity's serialized settings on the main thread before starting the worker.
+            var current = new Session { Device = new UnityShimmerSerialPort(devName, comPort.Trim()) };
+            int sensors = (int)enabledSensors;
+            // Avoid float serialization noise truncating the API's sampling divisor (51.2f -> 639 instead of 640).
+            double rate = Math.Round((double)samplingRate, 4);
+            int accel = (int)accelerometerRange, gsr = (int)gsrRange, gyro = (int)gyroscopeRange, mag = (int)magnetometerRange;
+            bool apply = applyConfigurationOnConnect, power = enableInternalExpPower;
+            bool lowAccel = enableLowPowerAccel, lowGyro = enableLowPowerGyro, lowMag = enableLowPowerMag;
+            current.Callback = (sender, args) => HandleEvent(current, args);
+            current.Device.UICallback += current.Callback;
+            current.Worker = new Thread(() =>
             {
-                if (shimmer != null)
+                try
                 {
-                    //Must run in new thread
-                    new Thread(() =>
+                    current.Device.Connect();
+                    if (!current.ConnectionReady.Wait(TimeSpan.FromSeconds(30)))
+                        throw new TimeoutException("Device initialization timed out. Check pairing, COM port and LogAndStream firmware.");
+                    if (current.Stopping) return;
+                    if (!current.Device.IsConnected())
+                        throw new InvalidOperationException("Unable to connect. Check that the sensor is powered on and the COM port is not occupied.");
+                    int hardware = current.Device.GetShimmerVersion();
+                    if (hardware != (int)ShimmerBluetooth.ShimmerVersion.SHIMMER3 && hardware != (int)ShimmerBluetooth.ShimmerVersion.SHIMMER3R)
+                        throw new NotSupportedException("This Unity wrapper supports Shimmer3 and Shimmer3R with LogAndStream firmware.");
+                    if (current.Device.GetFirmwareIdentifier() != ShimmerBluetooth.FW_IDENTIFIER_LOGANDSTREAM)
+                        throw new NotSupportedException("LogAndStream firmware is required.");
+                    if (apply)
                     {
-                        Thread.Sleep(waitBufferMilliseconds);
-                        shimmer.Disconnect();
-                    }).Start();
+                        // Configure only selected sensors. Shimmer3R's LIS2MDL has no legacy mag gain setting.
+                        current.Device.WriteSamplingRate(rate);
+                        if (current.Stopping) return;
+                        if ((sensors & (int)ShimmerConfig.SensorBitmap.SENSOR_D_ACCEL) != 0) current.Device.WriteAccelRange(accel);
+                        if ((sensors & (int)ShimmerConfig.SensorBitmap.SENSOR_GSR) != 0) current.Device.WriteGSRRange(gsr);
+                        if ((sensors & (int)ShimmerConfig.SensorBitmap.SENSOR_MPU9150_GYRO) != 0) current.Device.WriteGyroRange(gyro);
+                        if ((sensors & (int)ShimmerConfig.SensorBitmap.SENSOR_LSM303DLHC_MAG) != 0 && hardware == (int)ShimmerBluetooth.ShimmerVersion.SHIMMER3)
+                            current.Device.WriteMagRange(mag);
+                        if ((sensors & (int)ShimmerConfig.SensorBitmap.SENSOR_D_ACCEL) != 0) current.Device.SetLowPowerAccel(lowAccel);
+                        if ((sensors & (int)ShimmerConfig.SensorBitmap.SENSOR_MPU9150_GYRO) != 0) current.Device.SetLowPowerGyro(lowGyro);
+                        if ((sensors & (int)ShimmerConfig.SensorBitmap.SENSOR_LSM303DLHC_MAG) != 0) current.Device.SetLowPowerMag(lowMag);
+                        if ((sensors & 0x180018) != 0)
+                            current.Device.WriteEXGConfigurations(Shimmer3Configuration.EXG_EMG_CONFIGURATION_CHIP1, Shimmer3Configuration.EXG_EMG_CONFIGURATION_CHIP2);
+                        current.Device.WriteInternalExpPower(power ? 1 : 0);
+                        if (current.Stopping) return;
+                        current.Device.WriteSensors(sensors);
+                        if (current.Stopping) return;
+                        if (!current.Device.IsConnected()) throw new InvalidOperationException("Connection lost during configuration.");
+                        if (current.Device.GetEnabledSensors() != sensors)
+                            throw new InvalidOperationException("The device did not accept the selected sensors. Check the expansion module and sensor conflicts.");
+                    }
+                    current.Configured = true;
+                    current.States.Enqueue(State.Connected);
+                    while (!current.Stopping)
+                    {
+                        if (current.Commands.TryTake(out Action command, 100)) command();
+                    }
                 }
-            }
+                catch (Exception exception)
+                {
+                    if (!current.Stopping) current.Messages.Enqueue(exception.Message);
+                }
+                finally
+                {
+                    current.Stopping = true;
+                    current.Device.UICallback -= current.Callback;
+                    try { current.Device.CloseSafely(); }
+                    catch (Exception exception) { current.Messages.Enqueue(exception.Message); }
+                    try { current.Device.SerialPort.Dispose(); }
+                    catch (Exception exception) { current.Messages.Enqueue(exception.Message); }
+                    current.States.Enqueue(State.Disconnected);
+                }
+            }) { IsBackground = true, Name = "Shimmer " + comPort };
+            session = current;
+            HardwareVersion = -1;
+            FirmwareVersion = "";
+            ActualSamplingRate = 0;
+            ActualEnabledSensors = 0;
+            ReceivedPackets = 0;
+            LastError = "";
+            LastNotification = "";
+            current.Worker.Start();
+            SetState(State.Connecting);
         }
 
-        /// <summary>
-        /// Starts the streaming on the connected device
-        /// </summary>
         public void StartStreaming()
         {
-            if (CurrentState == State.Connected)
+            var current = session;
+            if (current == null || current.Stopping || CurrentState != State.Connected) return;
+            current.Commands.Add(() =>
             {
-                if (shimmer != null)
-                {
-                    new Thread(() =>
-                    {
-                        Thread.Sleep(waitBufferMilliseconds);
-                        shimmer.StartStreaming();
-                    }).Start();
-                }
-            }
+                if (current.Device.GetState() == ShimmerBluetooth.SHIMMER_STATE_CONNECTED) current.Device.StartStreaming();
+            });
         }
 
-        /// <summary>
-        /// Stops the streaming on the connected device
-        /// </summary>
         public void StopStreaming()
         {
-            if (CurrentState == State.Streaming)
+            var current = session;
+            if (current == null || current.Stopping || CurrentState != State.Streaming) return;
+            current.Commands.Add(() =>
             {
-                if (shimmer != null)
+                if (current.Device.GetState() == ShimmerBluetooth.SHIMMER_STATE_STREAMING) current.Device.StopStreaming();
+            });
+        }
+
+        public void Disconnect()
+        {
+            var current = session;
+            if (current == null || current.Stopping) return;
+            // Close during an unfinished handshake to interrupt blocking reads. Otherwise stop streaming first.
+            if (!current.Configured)
+            {
+                current.Stopping = true;
+                current.ConnectionReady.Set();
+                try { current.Device.SerialPort.Close(); } catch (Exception exception) { current.Messages.Enqueue(exception.Message); }
+            }
+            else current.Commands.Add(() =>
+            {
+                try
                 {
-                    new Thread(() =>
-                    {
-                        Thread.Sleep(waitBufferMilliseconds);
-                        shimmer.StopStreaming();
-                    }).Start();
+                    if (current.Device.GetState() == ShimmerBluetooth.SHIMMER_STATE_STREAMING) current.Device.StopStreaming();
                 }
-            }
+                finally { current.Stopping = true; }
+            });
         }
 
-        /// <summary>
-        /// Forces the connection thread to be aborted
-        /// </summary>
-        public void ForceAbortThread()
+        /// <summary>Kept for existing callers; cancels cooperatively instead of aborting a thread.</summary>
+        public void ForceAbortThread() => Shutdown();
+
+        private void Shutdown()
         {
-            if (shimmerThread != null)
+            var current = session;
+            if (current == null || !current.Worker.IsAlive) return;
+            Disconnect();
+            if (!current.Worker.Join(1500))
             {
-                shimmerThread.Abort();
+                current.Stopping = true;
+                current.ConnectionReady.Set();
+                try { current.Device.SerialPort.Close(); } catch (Exception exception) { current.Messages.Enqueue(exception.Message); }
+                if (!current.Worker.Join(3000)) Debug.LogWarning("Shimmer worker is still finishing; reconnect is blocked until it exits.", this);
             }
+            SetState(State.Disconnected);
         }
 
-        //The following region runs on a seperate thread to unity, you can not
-        //call ANYTHING UnityEngine related apart from Debug.Log()
-
-        #region Shimmer Thread
-
-
-        private void ConnectionThread()
+        private static void HandleEvent(Session current, EventArgs args)
         {
-            Debug.Log("THREAD: Starting shimmer device connection thread...");
-            shimmer =
-                new ShimmerLogAndStreamSystemSerialPort(
-                    devName: devName,
-                    bComPort: comPort,
-                    samplingRate: samplingRate,
-                    accelRange: (int)accelerometerRange,
-                    gsrRange: (int)gsrRange,
-                    gyroRange: (int)gyroscopeRange,
-                    magRange: (int)magnetometerRange,
-                    setEnabledSensors: (int)enabledSensors,
-                    enableLowPowerAccel: enableLowPowerAccel,
-                    enableLowPowerGyro: enableLowPowerGyro,
-                    enableLowPowerMag: enableLowPowerMag,
-                    exg1configuration: Shimmer3Configuration.EXG_EMG_CONFIGURATION_CHIP1,
-                    exg2configuration: Shimmer3Configuration.EXG_EMG_CONFIGURATION_CHIP2,
-                    internalexppower: enableInternalExpPower
-                );
-            shimmer.UICallback += HandleEvent;
-            shimmer.Connect();
-        }
-
-        private void HandleEvent(object sender, EventArgs args)
-        {
-            CustomEventArgs eventArgs = (CustomEventArgs)args;
-            int indicator = eventArgs.getIndicator();
-
-            switch (indicator)
+            if (!(args is CustomEventArgs eventArgs)) return;
+            if (current.Stopping && eventArgs.getIndicator() != (int)ShimmerBluetooth.ShimmerIdentifier.MSG_IDENTIFIER_NOTIFICATION_MESSAGE) return;
+            switch (eventArgs.getIndicator())
             {
-                //Occurs whenever the device's state has changed
                 case (int)ShimmerBluetooth.ShimmerIdentifier.MSG_IDENTIFIER_STATE_CHANGE:
-                    Debug.Log("THREAD: " + ((ShimmerBluetooth)sender).GetDeviceName() + " State = " + ((ShimmerBluetooth)sender).GetStateString() + System.Environment.NewLine);
                     int state = (int)eventArgs.getObject();
-                    if (state == (int)ShimmerBluetooth.SHIMMER_STATE_CONNECTED)
+                    if (state == ShimmerBluetooth.SHIMMER_STATE_CONNECTED)
                     {
-                        Debug.Log("THREAD: Connected " + connectionCount);
-                        CurrentState = State.Connected;
-                        shimmerStateQueue.Enqueue(CurrentState);
+                        current.ConnectionReady.Set();
+                        if (current.Configured) current.States.Enqueue(State.Connected);
                     }
-                    else if (state == (int)ShimmerBluetooth.SHIMMER_STATE_CONNECTING)
+                    else if (state == ShimmerBluetooth.SHIMMER_STATE_NONE)
                     {
-                        Debug.Log("THREAD: Connecting " + connectionCount);
-                        CurrentState = State.Connecting;
-                        shimmerStateQueue.Enqueue(CurrentState);
+                        current.ConnectionReady.Set();
+                        if (current.Configured)
+                        {
+                            current.Stopping = true;
+                            current.Messages.Enqueue("Connection lost. Check sensor power and Bluetooth pairing.");
+                        }
+                        // The worker publishes Disconnected after releasing the port and joining the reader.
                     }
-                    else if (state == (int)ShimmerBluetooth.SHIMMER_STATE_NONE)
-                    {
-                        Debug.Log("THREAD: Disconnected " + connectionCount);
-                        //Remove event handler
-                        shimmer.UICallback -= HandleEvent;
-                        CurrentState = State.Disconnected;
-                        shimmerStateQueue.Enqueue(CurrentState);
-                    }
-                    else if (state == (int)ShimmerBluetooth.SHIMMER_STATE_STREAMING)
-                    {
-                        Debug.Log("THREAD: Streaming " + connectionCount);
-                        CurrentState = State.Streaming;
-                        shimmerStateQueue.Enqueue(CurrentState);
-                    }
+                    else if (state == ShimmerBluetooth.SHIMMER_STATE_STREAMING) current.States.Enqueue(State.Streaming);
                     break;
                 case (int)ShimmerBluetooth.ShimmerIdentifier.MSG_IDENTIFIER_NOTIFICATION_MESSAGE:
+                    if (eventArgs.getMinorIndication() == (int)ShimmerLogAndStream.ShimmerSDBTMinorIdentifier.MSG_ERROR ||
+                        eventArgs.getMinorIndication() == (int)ShimmerLogAndStream.ShimmerSDBTMinorIdentifier.MSG_WARNING)
+                        current.Messages.Enqueue(Convert.ToString(eventArgs.getObject()));
+                    else current.Notifications.Enqueue(Convert.ToString(eventArgs.getObject()));
                     break;
                 case (int)ShimmerBluetooth.ShimmerIdentifier.MSG_IDENTIFIER_DATA_PACKET:
-                    ObjectCluster objectCluster = (ObjectCluster)eventArgs.getObject();
-                    shimmerDataQueue.Enqueue(objectCluster);
+                    if (current.Data.Count >= 4096 && current.Data.TryDequeue(out _)) Interlocked.Increment(ref current.DroppedPackets);
+                    current.Data.Enqueue((ObjectCluster)eventArgs.getObject());
                     break;
             }
         }
-
-        #endregion
-
     }
 
-    [System.Serializable]
-    /// <summary>
-    /// Custom unity event for capturing data from the shimmer device
-    /// </summary>
+    // Preserve the existing event types and serialized event field names.
+    [Serializable]
     public class DataRecievedEvent : UnityEvent<ShimmerDevice, ObjectCluster> { }
 
-    [System.Serializable]
-    /// <summary>
-    /// Custom unity event for listening to state change on the shimmer device
-    /// </summary>
+    [Serializable]
     public class StateChangeEvent : UnityEvent<ShimmerDevice, ShimmerDevice.State> { }
-
 }

@@ -87,6 +87,14 @@ namespace ShimmeringUnity
             AXIS_ANGLE_X,
             AXIS_ANGLE_Y,
             AXIS_ANGLE_Z,
+            // Append values to preserve serialized Shimmer3 signal selections.
+            GEN_EXT_ADC_A0,
+            GEN_EXT_ADC_A1,
+            GEN_EXT_ADC_A2,
+            GEN_INT_ADC_A0,
+            GEN_INT_ADC_A1,
+            GEN_INT_ADC_A2,
+            GEN_INT_ADC_A3,
         }
 
         /// <summary>
@@ -99,6 +107,13 @@ namespace ShimmeringUnity
         public static Dictionary<SignalName, string> NAME_DICT =
             new Dictionary<SignalName, string>()
         {
+            {SignalName.GEN_EXT_ADC_A0, ShimmerAPI.Shimmer3RConfiguration.SignalNames.GEN_EXT_ADC_A0},
+            {SignalName.GEN_EXT_ADC_A1, ShimmerAPI.Shimmer3RConfiguration.SignalNames.GEN_EXT_ADC_A1},
+            {SignalName.GEN_EXT_ADC_A2, ShimmerAPI.Shimmer3RConfiguration.SignalNames.GEN_EXT_ADC_A2},
+            {SignalName.GEN_INT_ADC_A0, ShimmerAPI.Shimmer3RConfiguration.SignalNames.GEN_INT_ADC_A0},
+            {SignalName.GEN_INT_ADC_A1, ShimmerAPI.Shimmer3RConfiguration.SignalNames.GEN_INT_ADC_A1},
+            {SignalName.GEN_INT_ADC_A2, ShimmerAPI.Shimmer3RConfiguration.SignalNames.GEN_INT_ADC_A2},
+            {SignalName.GEN_INT_ADC_A3, ShimmerAPI.Shimmer3RConfiguration.SignalNames.GEN_INT_ADC_A3},
             {SignalName.TIMESTAMP, "Timestamp"},
             {SignalName.SYSTEM_TIMESTAMP, "System Timestamp"},
             {SignalName.SYSTEM_TIMESTAMP_PLOT, "System Timestamp Plot"},
@@ -221,6 +236,7 @@ namespace ShimmeringUnity
             SENSOR_EXT_A15 = 0x0800,
             SENSOR_INT_A1 = 0x0400,
             SENSOR_INT_A12 = 0x0200,
+            [UnityEngine.InspectorName("PPG / Shimmer3 Int A13 / Shimmer3R Int A1")]
             SENSOR_INT_A13 = 0x0100,
             SENSOR_INT_A14 = 0x800000,
             SENSOR_BMP180_PRESSURE = 0x40000,
@@ -228,7 +244,46 @@ namespace ShimmeringUnity
             SENSOR_EXG2_24BIT = 0x08,
             SENSOR_EXG1_16BIT = 0x100000,
             SENSOR_EXG2_16BIT = 0x080000,
-            SENSOR_BRIDGE_AMP = 0x8000
+            SENSOR_BRIDGE_AMP = 0x8000,
+            SENSOR_ACCEL_ALT = 0x400000,
+            SENSOR_MAG_ALT = 0x200000
+        }
+
+        /// <summary>Shimmer3R ADC names differ although the sensor bits remain compatible.</summary>
+        [System.Flags]
+        public enum SensorBitmapShimmer3R
+        {
+            SENSOR_EXT_A0 = 0x02,
+            SENSOR_EXT_A1 = 0x01,
+            SENSOR_EXT_A2 = 0x0800,
+            SENSOR_INT_A3 = 0x0400,
+            SENSOR_INT_A0 = 0x0200,
+            SENSOR_INT_A1 = 0x0100,
+            SENSOR_INT_A2 = 0x800000,
+            SENSOR_BMP380_PRESSURE = 0x40000
+        }
+
+        public static string GetPPGSignalName(bool isShimmer3R) => isShimmer3R
+            ? ShimmerAPI.Shimmer3RConfiguration.SignalNames.GEN_INT_ADC_A1
+            : ShimmerAPI.Shimmer3Configuration.SignalNames.INTERNAL_ADC_A13;
+
+        // Resolve old selections by physical channel, not by the coincidentally matching label.
+        public static string GetSignalName(SignalName signal, bool isShimmer3R)
+        {
+            if (isShimmer3R)
+            {
+                switch (signal)
+                {
+                    case SignalName.EXTERNAL_ADC_A7: return NAME_DICT[SignalName.GEN_EXT_ADC_A0];
+                    case SignalName.EXTERNAL_ADC_A6: return NAME_DICT[SignalName.GEN_EXT_ADC_A1];
+                    case SignalName.EXTERNAL_ADC_A15: return NAME_DICT[SignalName.GEN_EXT_ADC_A2];
+                    case SignalName.INTERNAL_ADC_A1: return NAME_DICT[SignalName.GEN_INT_ADC_A3];
+                    case SignalName.INTERNAL_ADC_A12: return NAME_DICT[SignalName.GEN_INT_ADC_A0];
+                    case SignalName.INTERNAL_ADC_A13: return NAME_DICT[SignalName.GEN_INT_ADC_A1];
+                    case SignalName.INTERNAL_ADC_A14: return NAME_DICT[SignalName.GEN_INT_ADC_A2];
+                }
+            }
+            return NAME_DICT[signal];
         }
 
         /// <summary>
@@ -285,7 +340,7 @@ namespace ShimmeringUnity
         {
             [UnityEngine.InspectorName("± 1.3Ga")]
             one = 1,
-            [UnityEngine.InspectorName("± 1.3Ga")]
+            [UnityEngine.InspectorName("± 1.9Ga")]
             two = 2,
             [UnityEngine.InspectorName("± 2.5Ga")]
             three = 3,

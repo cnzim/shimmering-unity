@@ -1,72 +1,111 @@
-using System.Collections;
-using System.Collections.Generic;
-using UnityEngine;
+using System;
 using ShimmerAPI;
 using ShimmerLibrary;
-using System;
+using UnityEngine;
 
 namespace ShimmeringUnity
 {
     /// <summary>
-    /// Basic example of measuring heart rate from the shimmer device
-    /// Ensure the ShimmerDevice has internalExpPower enabled and the
-    /// INTERNAL_ADC_A13 sensor enabled. Also ensure the correct
-    /// sampling rate is set before running the application.
+    /// PPG requires expansion power and bit 0x0100 (Shimmer3 A13 / Shimmer3R A1).
+    /// Filters and the algorithm reset for each stream using the actual sample rate.
     /// </summary>
     public class ShimmerHeartRateMonitor : MonoBehaviour
     {
-        [SerializeField]
-        private ShimmerDevice shimmerDevice;
+        [SerializeField] private ShimmerDevice shimmerDevice;
+        [Header("Output:")]
+        [SerializeField] private int heartRate;
+        [Header("Settings:")]
+        [SerializeField] private int numberOfHeartBeatsToAverage = 1;
+        [Header("Info:")]
+        [SerializeField] private double ppgMillivolts;
+        [SerializeField] private double filteredPPG;
+        [SerializeField] private long ppgSamples;
+        [SerializeField] private string ppgSignal = "";
+        [SerializeField] private string status = "Not streaming";
 
-        [SerializeField]
-        private int heartRate;
-        Filter LPF_PPG;
-        Filter HPF_PPG;
-        PPGToHRAlgorithm PPGtoHeartRateCalculation;
-        int NumberOfHeartBeatsToAverage = 1;
-        int TrainingPeriodPPG = 10; //10 second buffer
-        double LPF_CORNER_FREQ_HZ = 5;
-        double HPF_CORNER_FREQ_HZ = 0.5;
+        public int HeartRate => heartRate;
+        public double PPGMillivolts => ppgMillivolts;
+        public long PPGSamples => ppgSamples;
+        public string Status => status;
 
-        private void Awake()
-        {
-            //Create the heart rate algorithms 
-            PPGtoHeartRateCalculation = new PPGToHRAlgorithm(shimmerDevice.SamplingRate, NumberOfHeartBeatsToAverage, TrainingPeriodPPG);
-            LPF_PPG = new Filter(Filter.LOW_PASS, shimmerDevice.SamplingRate, new double[] { LPF_CORNER_FREQ_HZ });
-            HPF_PPG = new Filter(Filter.HIGH_PASS, shimmerDevice.SamplingRate, new double[] { HPF_CORNER_FREQ_HZ });
-        }
+        private Filter lowPass;
+        private Filter highPass;
+        private PPGToHRAlgorithm algorithm;
+        private bool warnedMissingSignal;
+        private const int TrainingSeconds = 10;
+
         private void OnEnable()
         {
+            if (shimmerDevice == null) return;
             shimmerDevice.OnDataRecieved.AddListener(OnDataRecieved);
+            shimmerDevice.OnStateChanged.AddListener(OnStateChanged);
+            if (shimmerDevice.CurrentState == ShimmerDevice.State.Streaming) ResetAlgorithm();
         }
 
         private void OnDisable()
         {
+            if (shimmerDevice == null) return;
             shimmerDevice.OnDataRecieved.RemoveListener(OnDataRecieved);
+            shimmerDevice.OnStateChanged.RemoveListener(OnStateChanged);
+        }
+
+        private void OnStateChanged(ShimmerDevice device, ShimmerDevice.State state)
+        {
+            if (state == ShimmerDevice.State.Streaming) ResetAlgorithm();
+            else
+            {
+                heartRate = 0;
+                algorithm = null;
+                status = state.ToString();
+            }
+        }
+
+        private void ResetAlgorithm()
+        {
+            heartRate = 0;
+            ppgSamples = 0;
+            warnedMissingSignal = false;
+            double rate = shimmerDevice.ActualSamplingRate;
+            ppgSignal = ShimmerConfig.GetPPGSignalName(shimmerDevice.IsShimmer3R);
+            if (rate <= 10 || double.IsNaN(rate) || double.IsInfinity(rate))
+            {
+                algorithm = null;
+                status = "PPG requires a sample rate above 10 Hz (51.2 Hz recommended).";
+                Debug.LogWarning(status, this);
+                return;
+            }
+            lowPass = new Filter(Filter.LOW_PASS, rate, new[] { 5.0 });
+            highPass = new Filter(Filter.HIGH_PASS, rate, new[] { 0.5 });
+            algorithm = new PPGToHRAlgorithm(rate, numberOfHeartBeatsToAverage, TrainingSeconds);
+            status = "Training (10 seconds); attach the PPG sensor.";
         }
 
         private void OnDataRecieved(ShimmerDevice device, ObjectCluster objectCluster)
         {
-            //Get heart rate data
-            SensorData dataPPG = objectCluster.GetData(
-                ShimmerConfig.NAME_DICT[ShimmerConfig.SignalName.INTERNAL_ADC_A13],
-                ShimmerConfig.FORMAT_DICT[ShimmerConfig.SignalFormat.CAL]
-            );
-            //Get system  timestamp data
-            SensorData dataTS = objectCluster.GetData(
-                ShimmerConfig.NAME_DICT[ShimmerConfig.SignalName.SYSTEM_TIMESTAMP],
-                ShimmerConfig.FORMAT_DICT[ShimmerConfig.SignalFormat.CAL]
-            );
-
-            //Early out if either sensor data is null
-            if (dataPPG == null || dataTS == null)
+            if (algorithm == null) return;
+            SensorData ppg = objectCluster.GetData(ppgSignal, ShimmerConfiguration.SignalFormats.CAL);
+            SensorData timestamp = objectCluster.GetData(ShimmerConfiguration.SignalNames.SYSTEM_TIMESTAMP, ShimmerConfiguration.SignalFormats.CAL);
+            if (ppg == null || timestamp == null)
+            {
+                heartRate = 0;
+                status = $"Missing {ppgSignal} or timestamp. Enable PPG (0x0100) and expansion power.";
+                if (!warnedMissingSignal)
+                {
+                    Debug.LogWarning(status, this);
+                    warnedMissingSignal = true;
+                }
                 return;
-
-            //Calculate the heart rate
-            double dataFilteredLP = LPF_PPG.filterData(dataPPG.Data);
-            double dataFilteredHP = HPF_PPG.filterData(dataFilteredLP);
-            heartRate = (int)Math.Round(PPGtoHeartRateCalculation.ppgToHrConversion(dataFilteredHP, dataTS.Data));
+            }
+            if (double.IsNaN(ppg.Data) || double.IsInfinity(ppg.Data)) return;
+            ppgMillivolts = ppg.Data;
+            ppgSamples++;
+            filteredPPG = highPass.filterData(lowPass.filterData(ppg.Data));
+            double result = algorithm.ppgToHrConversion(filteredPPG, timestamp.Data);
+            bool valid = !double.IsNaN(result) && !double.IsInfinity(result) && result > 0;
+            heartRate = valid ? (int)Math.Round(result) : 0;
+            status = ppgSamples < device.ActualSamplingRate * TrainingSeconds
+                ? "Training (10 seconds)"
+                : valid ? "Receiving PPG / heart rate" : "Receiving PPG; waiting for a stable pulse";
         }
     }
-
 }
