@@ -12,7 +12,7 @@ If you would like to use this package in your projects or research please acknow
 
 > Note: This was tested with a shimmer3 device on unity 2021.3.X (please use a different version with caution).
 
-1. Download the latest [unity package](https://github.com/jemmec/shimmering-unity/releases/latest) from releases and import it into your unity project.
+1. Download the latest [unity package](https://github.com/cnzim/shimmering-unity/releases/latest) from releases and import it into your unity project.
 
 2. Add the `ShimmerDevice` component to a GameObject in your scene (alternatively, open the `ExampleScene` scene).
 
