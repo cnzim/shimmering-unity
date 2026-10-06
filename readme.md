@@ -10,7 +10,7 @@ If you would like to use this package in your projects or research please acknow
 
 ## Usage :question:
 
-> Note: This was tested with a shimmer3 device on unity 2021.3.X (please use a different version with caution).
+> Note: This was tested with a shimmer3 device and a shimmer3R device on unity 6.3.X LTS (please use a different version with caution).
 
 1. Download the latest [unity package](https://github.com/cnzim/shimmering-unity/releases/latest) from releases and import it into your unity project.
 
